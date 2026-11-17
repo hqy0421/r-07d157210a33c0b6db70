@@ -1,6 +1,29 @@
 Changes in Bubbles
 ==================
 
+Unreleased
+==========
+
+* Fact-grain aware aggregation. Measures can declare a non-NULL grain key
+  (new `measure_grains` argument of `aggregate`, or a `MeasureGrains`
+  annotation carried by data objects) so that a master-level measure joined
+  with detail rows is contributed once per surviving fact identity instead
+  of once per fan-out row. Detail-level measures follow their own grain.
+  Facts are de-duplicated by identity, never by measure value; conflicting
+  values for one identity raise `GrainConflictError`; sum ignores NULL and
+  an all-NULL grain yields NULL.
+* New `grain_counts` argument of `aggregate`: distinct identity counts per
+  grain, independent of measure values.
+* Grain declarations propagate through native joins, row filters and
+  `field_filter`. A grain-key column removed by a field filter is retained
+  as a hidden field (new `Field.hidden` flag and
+  `FieldList.visible_fields`/`hidden_fields`) so the identity is not lost.
+* SQL backend implements grain-aware aggregation with window functions and
+  materializes the grouped result; dialects without window-function support
+  retry through the row-wise implementation.
+* Objects without grain declarations keep the previous aggregation
+  semantics unchanged.
+
 0.2
 ===
 

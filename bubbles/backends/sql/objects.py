@@ -475,6 +475,10 @@ class SQLDataObject(DataObject):
         fields = fields or self.fields.clone()
         obj = SQLStatement(statement, self.store, fields=fields,
                                     schema=self.schema)
+        # Fact-grain declarations describe the data semantics and survive
+        # statement derivations that keep the same rows/columns.
+        from ...grains import get_measure_grains
+        obj.measure_grains = get_measure_grains(self)
         return obj
 
 class SQLStatement(SQLDataObject):
@@ -521,6 +525,12 @@ class SQLStatement(SQLDataObject):
             self.fields = fields
         else:
             self.fields = reflect_fields(statement)
+
+        # Fact-grain declarations of the measures in this statement. Empty
+        # by default; propagated by clone_statement() and row-preserving
+        # operations.
+        from ...grains import MeasureGrains
+        self.measure_grains = MeasureGrains()
 
     def as_target(self):
         raise DataObjectError("SQL statement (%s) can not be used "
@@ -650,6 +660,9 @@ class SQLTable(SQLDataObject):
         self._insert_buffer = []
         self.insert_statement = self.table.insert()
         # SQL Statement representation
+
+        from ...grains import MeasureGrains
+        self.measure_grains = MeasureGrains()
 
     def rows(self):
         return iter(self.table.select().execute())

@@ -96,3 +96,20 @@ class GraphError(BubblesError):
 class FieldError(BubblesError):
     """Raised when wrong field types are passed to an operation."""
     pass
+
+class GrainConflictError(BubblesError):
+    """Raised when rows sharing the same grain identity carry different
+    values of a measure within one aggregation group. The grain identity is
+    supposed to identify one fact (one order, one detail line) and therefore
+    its measure value must be consistent across all the rows the join
+    fan-out produced for that fact."""
+    def __init__(self, message=None, measure=None, grain=None,
+                 identity=None, values=None):
+        self.measure = measure
+        self.grain = grain
+        self.identity = identity
+        self.values = values
+        if message is None:
+            message = ("Conflicting values %r for measure '%s' at grain '%s' "
+                       "identity %r" % (values, measure, grain, identity))
+        super(GrainConflictError, self).__init__(message)

@@ -7,6 +7,7 @@
 from .errors import *
 from .extensions import Extensible, extensions
 from .metadata import *
+from .grains import MeasureGrains, prepare_measure_grains, get_measure_grains
 from .dev import required, experimental
 
 __all__ = [
@@ -238,6 +239,10 @@ class IterableDataSource(DataObject):
         """Create a data object that wraps an iterable."""
         self.fields = fields
         self.iterable = iterable
+        # Fact-grain declarations of the measures carried by this object.
+        # Empty by default; operations that preserve rows (filters, joins)
+        # propagate or merge this annotation.
+        self.measure_grains = MeasureGrains()
 
     def representations(self):
         """Returns the only representation of iterable object, which is
@@ -264,9 +269,18 @@ class IterableDataSource(DataObject):
         return RowListDataObject(list(self.iterable), self.fields)
 
     def filter(self, keep=None, drop=None, rename=None):
-        """Returns another iterable data source with filtered fields"""
+        """Returns another iterable data source with filtered fields.
 
-        ffilter = FieldFilter(keep=keep, drop=drop, rename=rename)
+        Fields that serve as grain keys on this object are protected: when
+        the keep/drop selection would remove them, they remain in the row
+        layout as hidden fields so that grain identities survive the
+        filtering. Grain declarations are renamed together with their
+        columns.
+        """
+
+        grain_fields = self._grain_field_names()
+        ffilter = FieldFilter(keep=keep, drop=drop, rename=rename,
+                              grain_fields=grain_fields)
         fields = ffilter.filter(self.fields)
 
         if keep or drop:
@@ -276,7 +290,20 @@ class IterableDataSource(DataObject):
             # No need to filter if we are just renaming, reuse the iterator
             iterator = self.iterable
 
-        return IterableDataSource(iterator, fields)
+        result = IterableDataSource(iterator, fields)
+        result.measure_grains = get_measure_grains(self).renamed(
+            ffilter.rename)
+        return result
+
+    def _grain_field_names(self):
+        """Collects all field names participating in any grain declaration
+        (measure grain keys as well as counted grain keys)."""
+        names = []
+        for declaration in get_measure_grains(self).declarations():
+            for name in declaration.grain:
+                if name not in names:
+                    names.append(name)
+        return names
 
 
 class IterableRecordsDataSource(IterableDataSource):
@@ -331,6 +358,7 @@ class RowListDataObject(DataObject):
             self.data = []
         else:
             self.data = data
+        self.measure_grains = MeasureGrains()
 
     def representations(self):
         """Returns the only representation of iterable object, which is

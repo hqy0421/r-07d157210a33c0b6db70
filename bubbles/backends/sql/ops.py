@@ -3,8 +3,11 @@ from ...operation import RetryOperation
 from ...prototypes import *
 from ...metadata import Field, FieldList, FieldFilter
 from ...metadata import prepare_aggregation_list, prepare_order_list
-from ...objects import IterableDataSource
+from ...objects import IterableDataSource, RowListDataObject
 from ...errors import *
+from ...grains import (GrainConflictError,
+                       prepare_measure_grains, get_measure_grains,
+                       merge_measure_grains)
 from .utils import prepare_key, zip_condition, join_on_clause
 
 try:
@@ -28,16 +31,33 @@ def _unary(func):
 # Metadata Operations
 
 @field_filter.register("sql")
-def _(ctx, obj, keep=None, drop=None, rename=None):
-    """Returns a statement with fields according to the field filter"""
+def _(ctx, obj, keep=None, drop=None, rename=None, filter=None):
+    """Returns a statement with fields according to the field filter.
+
+    Grain-key fields referenced by the object's measure-grain declarations
+    are protected: a selection that would drop them keeps the columns in the
+    statement (and therefore in the row layout) but marks the corresponding
+    fields hidden, so grain identities survive column filtering while the
+    visible schema matches the requested fields exactly."""
     # TODO: preserve order of "keep" -> see FieldFilter
 
-    field_filter = FieldFilter(keep=keep, drop=drop, rename=rename)
+    if filter:
+        if keep or drop or rename:
+            raise OperationError("Either filter or keep, drop, rename should "
+                                 "be used")
+        field_filter = filter
+    else:
+        grain_fields = _sql_grain_field_names(obj)
+        field_filter = FieldFilter(keep=keep, drop=drop, rename=rename,
+                                   grain_fields=grain_fields)
 
     statement = obj.sql_statement()
     statement = statement.alias("__ff")
 
     columns = []
+
+    # The mask keeps protected grain columns even when they are hidden.
+    row_filter = field_filter.row_filter(obj.fields)
 
     for field in obj.fields:
         name = str(field)
@@ -46,14 +66,25 @@ def _(ctx, obj, keep=None, drop=None, rename=None):
             column = column.label(field_filter.rename[name])
         columns.append(column)
 
-    row_filter = field_filter.row_filter(obj.fields)
     selection = row_filter(columns)
 
     statement = sql.expression.select(selection, from_obj=statement)
     fields = field_filter.filter(obj.fields)
 
     result = obj.clone_statement(statement=statement, fields=fields)
+    result.measure_grains = get_measure_grains(obj).renamed(
+        field_filter.rename)
     return result
+
+
+def _sql_grain_field_names(obj):
+    """Collects every field name used as a grain key on `obj`."""
+    names = []
+    for declaration in get_measure_grains(obj).declarations():
+        for name in declaration.grain:
+            if name not in names:
+                names.append(name)
+    return names
 
 
 #############################################################################
@@ -206,19 +237,112 @@ aggregation_functions = {
 
 @aggregate.register("sql")
 def _(ctx, obj, key, measures=None, include_count=True,
-              count_field="record_count"):
+              count_field="record_count", measure_grains=None,
+              grain_counts=None):
 
-    """Aggregate `measures` by `key`"""
+    """Aggregate `measures` by `key`.
 
-    keys = prepare_key(key)
+    When no fact-grain declarations are present (neither in
+    `measure_grains` nor attached to `obj`), the classic row-wise SQL
+    aggregation is used unchanged.
+
+    With grain declarations the aggregation becomes fact-grain aware and is
+    expressed with window functions – the same deduplication technique
+    mature BI engines use for joined fact tables: every grain measure is
+    reduced to one value per surviving grain identity inside a subquery,
+    then aggregated normally. Conflicting values for one identity are
+    detected through a separate ``COUNT(DISTINCT ...)`` probe that raises
+    :class:`GrainConflictError`. If the database cannot execute the window
+    functions, the operation retries through the fully materialized row-wise
+    implementation, whose result remains a natively consumable rows object.
+    """
+
+    # The metadata-level prepare_key tolerates a None key (whole-table
+    # aggregation); the SQL backend's variant does not, so normalize here.
+    keys = prepare_key(key) if key else ()
 
     if measures:
         measures = prepare_aggregation_list(measures)
     else:
         measures = []
 
+    effective_grains = prepare_measure_grains(
+        measure_grains if measure_grains is not None
+        else get_measure_grains(obj))
+    if effective_grains:
+        effective_grains.validate(obj.fields)
+
+    grain_counts = _prepare_sql_grain_counts(grain_counts, obj)
+
+    if not effective_grains and not grain_counts:
+        return _aggregate_sql_legacy(obj, keys, measures, include_count,
+                                     count_field)
+
+    try:
+        statement_object = _aggregate_sql_grain_aware(
+            ctx, obj, keys, measures, include_count, count_field,
+            effective_grains, grain_counts)
+    except GrainConflictError:
+        # A semantic conflict must reach the caller verbatim instead of
+        # being masked by the row-wise fallback.
+        raise
+    except (sqlalchemy.exc.SQLAlchemyError, NotImplementedError) as error:
+        # The statement could not even be built with window functions:
+        # fall back to the materialized row-wise implementation below.
+        raise RetryOperation(["rows"],
+                             reason="SQL grain aggregation unavailable "
+                                    "(%s); using materialized row aggregation"
+                                    % error)
+
+    # Eagerly materialize the grouped result. This (a) makes a dialect that
+    # rejects window functions fail inside this operation call, where the
+    # retry below can catch it, and (b) returns a plain rows object that any
+    # consumer can read natively. The expensive fan-out and dedup still
+    # happen inside the database; only the compact grouped output is held.
+    try:
+        data = [tuple(row) for row in statement_object.rows()]
+    except GrainConflictError:
+        raise
+    except Exception as error:
+        # Drivers surface unsupported window functions through different
+        # exception hierarchies, so any execution failure is retried rather
+        # than trusted to be a particular SQLAlchemy error class.
+        raise RetryOperation(["rows"],
+                             reason="SQL grain aggregation could not be "
+                                    "executed (%s); using materialized row "
+                                    "aggregation" % error)
+
+    return RowListDataObject(data, fields=statement_object.fields)
+
+
+def _prepare_sql_grain_counts(grain_counts, obj):
+    if not grain_counts:
+        return []
+
+    result = []
+    for item in grain_counts:
+        if isinstance(item, (list, tuple)):
+            output_name, grain = item
+        else:
+            grain = item
+            output_name = "%s_count" % str(grain)
+        grain_key = prepare_key(grain)
+        for name in grain_key:
+            if name not in obj.fields.names():
+                raise NoSuchFieldError(
+                    "Grain count field '%s' is not a field of the object"
+                    % name)
+        result.append((output_name, grain_key))
+    return result
+
+
+def _aggregate_sql_legacy(obj, keys, measures, include_count, count_field):
+    """The original SQL aggregation, unchanged for objects without grain
+    declarations."""
+
     out_fields = FieldList()
-    out_fields += obj.fields.fields(keys)
+    if keys:
+        out_fields += obj.fields.fields(keys)
     out_fields += obj.fields.aggregated_fields(
         measures, include_count, count_field)
 
@@ -242,6 +366,193 @@ def _(ctx, obj, key, measures=None, include_count=True,
                                       group_by=group)
 
     return obj.clone_statement(statement=statement, fields=out_fields)
+
+
+def _aggregate_sql_grain_aware(ctx, obj, keys, measures, include_count,
+                               count_field, measure_grains, grain_counts):
+    statement = obj.sql_statement().alias("__ga_src")
+
+    # Split measures into row-wise (no declared grain) and grain-aware ones.
+    row_measures = []
+    grain_measures = []
+    for name, agg_name in measures:
+        grain = measure_grains.grain_for(name)
+        if grain is None:
+            row_measures.append((name, agg_name))
+        else:
+            if agg_name not in ("sum", "min", "max", "average", "count"):
+                raise ArgumentError(
+                    "Grain-aware aggregation '%s' is not supported for "
+                    "measure '%s'" % (agg_name, name))
+            grain_measures.append((name, agg_name, grain))
+
+    _probe_grain_conflicts(obj, statement, keys, grain_measures)
+
+    group_cols = [statement.c[str(key)] for key in keys]
+
+    # Inner select: group keys, raw measure columns, plus one row-number
+    # column per grain measure/grain count. The row number is partitioned by
+    # the output group plus the grain identity, so rn == 1 marks the single
+    # surviving fact per identity. Row-wise measures keep their raw row
+    # values and are aggregated in the outer select, matching the legacy
+    # fan-out semantics for measures without a declared grain.
+    inner_selection = list(group_cols)
+
+    # Every measure column is passed through so the outer select can
+    # reference it by name, whether or not the measure is grain aware.
+    for name, agg_name in measures:
+        inner_selection.append(statement.c[str(name)])
+
+    # Window PARTITION BY lists. The grouping keys are always part of the
+    # partition so identities are counted within each output group.
+    def partition_columns(grain):
+        return group_cols + [statement.c[str(g)] for g in grain]
+
+    # Metadata for the generated row-number columns, consumed when building
+    # the outer expressions.
+    dedup_labels = []
+
+    for name, agg_name, grain in grain_measures:
+        measure_col = statement.c[str(name)]
+        partition = partition_columns(grain)
+        # Include the aggregate in the label so one measure aggregated
+        # several times (sum + average + ...) does not collide on one
+        # row-number column name.
+        rn_label = "__rn_%s_%s" % (name, agg_name)
+        # Non-NULL values sort first, so the surviving row carries a value
+        # whenever the fact has one; equal values are indistinguishable,
+        # which is the desired behaviour.
+        row_number = sqlalchemy.func.row_number().over(
+            partition_by=partition,
+            order_by=measure_col.desc())
+        inner_selection.append(row_number.label(rn_label))
+        dedup_labels.append(("measure", name, agg_name, grain, rn_label))
+
+    for output_name, grain in grain_counts:
+        partition = partition_columns(grain)
+        rn_label = "__rn_count_%s" % "_".join(grain)
+        first_grain_col = statement.c[str(grain[0])]
+        row_number = sqlalchemy.func.row_number().over(
+            partition_by=partition,
+            order_by=first_grain_col.asc())
+        inner_selection.append(row_number.label(rn_label))
+        dedup_labels.append(("count", output_name, grain, rn_label, None))
+
+    inner = sql.expression.select(inner_selection,
+                                  from_obj=statement).alias("__ga_dedup")
+
+    outer_selection = [inner.c[str(key)] for key in keys]
+    out_fields = FieldList()
+    if keys:
+        out_fields += obj.fields.fields(keys)
+
+    # Row-wise measures first, in original measure order. To keep output
+    # ordering identical to the rows backend we remember the position.
+    ordered_outputs = []
+    for name, agg_name in measures:
+        grain = measure_grains.grain_for(name)
+        if grain is None:
+            ordered_outputs.append(("row", name, agg_name))
+        else:
+            ordered_outputs.append(("grain", name, agg_name))
+
+    for output_name, grain in grain_counts:
+        ordered_outputs.append(("grain_count", output_name, grain))
+
+    # Build outer expressions.
+    for kind, *payload in ordered_outputs:
+        if kind == "row":
+            name, agg_name = payload
+            label = "%s_%s" % (name, agg_name)
+            func = aggregation_functions[agg_name]
+            outer_selection.append(func(inner.c[name]).label(label))
+            field = obj.fields.field(name)
+            out_fields.append(field.clone(name=label,
+                                           analytical_type="measure"))
+        elif kind == "grain":
+            name, agg_name = payload
+            label = "%s_%s" % (name, agg_name)
+            rn_label = "__rn_%s_%s" % (name, agg_name)
+            measure_col = inner.c[name]
+            rn_col = inner.c[rn_label]
+            surviving = sql.expression.case(
+                [(rn_col == 1, measure_col)], else_=None)
+
+            if agg_name == "sum":
+                expr = sqlalchemy.func.sum(surviving)
+            elif agg_name == "min":
+                expr = sqlalchemy.func.min(surviving)
+            elif agg_name == "max":
+                expr = sqlalchemy.func.max(surviving)
+            elif agg_name == "average":
+                expr = sqlalchemy.func.avg(surviving)
+            elif agg_name == "count":
+                expr = sqlalchemy.func.sum(
+                    sql.expression.case([(rn_col == 1, 1)], else_=0))
+            outer_selection.append(expr.label(label))
+            field = obj.fields.field(name)
+            out_fields.append(field.clone(name=label,
+                                           analytical_type="measure"))
+        else:
+            output_name, grain = payload
+            rn_label = "__rn_count_%s" % "_".join(grain)
+            rn_col = inner.c[rn_label]
+            expr = sqlalchemy.func.sum(
+                sql.expression.case([(rn_col == 1, 1)], else_=0))
+            outer_selection.append(expr.label(output_name))
+            out_fields.append(Field(output_name,
+                                    storage_type="integer",
+                                    analytical_type="measure"))
+
+    if include_count:
+        outer_selection.append(
+            sqlalchemy.func.count(1).label(count_field))
+        out_fields.append(Field(count_field,
+                                storage_type="integer",
+                                analytical_type="measure"))
+
+    outer_group = [inner.c[str(key)] for key in keys]
+    final_statement = sql.expression.select(outer_selection,
+                                            from_obj=inner,
+                                            group_by=outer_group)
+
+    return obj.clone_statement(statement=final_statement,
+                               fields=out_fields)
+
+
+def _probe_grain_conflicts(obj, statement, keys, grain_measures):
+    """Raises GrainConflictError when a grain identity maps to more than one
+    distinct non-NULL measure value within one aggregation group.
+
+    The probe is one extra grouped query per grain measure and is executed
+    eagerly so conflicts surface as an explicit error rather than as silent
+    over-counting.
+    """
+
+    group_cols = [statement.c[str(key)] for key in keys]
+
+    for name, agg_name, grain in grain_measures:
+        measure_col = statement.c[str(name)]
+        grain_cols = [statement.c[str(g)] for g in grain]
+        distinct = sqlalchemy.func.count(
+            sqlalchemy.func.distinct(measure_col))
+        probe = sql.expression.select(
+            group_cols + grain_cols + [distinct.label("__distinct")],
+            from_obj=statement,
+            whereclause=measure_col != None,
+            group_by=group_cols + grain_cols,
+            having=distinct > 1,
+            limit=1)
+        rows = obj.store.execute(probe).fetchall()
+        if rows:
+            offending = rows[0]
+            identity = tuple(offending[len(keys) + i]
+                             for i in range(len(grain)))
+            raise GrainConflictError(
+                measure=name,
+                grain=grain,
+                identity=identity,
+                values="multiple distinct values")
 
 
 #############################################################################
@@ -428,7 +739,28 @@ def _(ctx, master, detail, master_key, detail_key):
                                 from_obj=joined,
                                 use_labels=True)
 
-    return master.clone_statement(statement=select, fields=out_fields)
+    result = master.clone_statement(statement=select, fields=out_fields)
+    # The join fans master rows out but preserves every fact of both sides,
+    # so their grain declarations stay valid and are combined.
+    result.measure_grains = merge_measure_grains(master, detail)
+    _validate_sql_grain_fields(result)
+    return result
+
+
+def _validate_sql_grain_fields(obj):
+    """Checks that every field referenced by grain declarations is present
+    in the resulting object."""
+    names = set(obj.fields.names())
+    for declaration in get_measure_grains(obj).declarations():
+        if declaration.measure not in names:
+            raise NoSuchFieldError(
+                "Grain measure '%s' was lost during the operation"
+                % declaration.measure)
+        for name in declaration.grain:
+            if name not in names:
+                raise NoSuchFieldError(
+                    "Grain key field '%s' of measure '%s' was lost during "
+                    "the operation" % (name, declaration.measure))
 
 # TODO: deprecated
 @join_details.register("sql", "sql[]", name="join_details")
@@ -494,7 +826,13 @@ def _(ctx, master, details, joins):
                                 from_obj=joined,
                                 use_labels=True)
 
-    return master.clone_statement(statement=select, fields=out_fields)
+    result = master.clone_statement(statement=select, fields=out_fields)
+    merged = get_measure_grains(master)
+    for detail in details:
+        merged = merge_measure_grains(merged, detail)
+    result.measure_grains = merged
+    _validate_sql_grain_fields(result)
+    return result
 
 
 @added_keys.register("sql", "sql")

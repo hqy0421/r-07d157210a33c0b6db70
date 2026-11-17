@@ -83,7 +83,8 @@ FIELD_ATTRIBUTES = (
     "missing_value",
     "info",
     "origin",
-    "description"
+    "description",
+    "hidden"
 )
 
 
@@ -190,7 +191,8 @@ class Field(object):
 
     def __init__(self, name=None, storage_type=None, analytical_type=None,
                  concrete_storage_type=None, size=None, missing_value=None,
-                 label=None, info=None, origin=None, description=None):
+                 label=None, info=None, origin=None, description=None,
+                 hidden=False):
 
         self.name = name
         self.storage_type = storage_type
@@ -202,6 +204,11 @@ class Field(object):
         self.info = info
         self.origin = origin
         self.description = description
+        # A hidden field stays part of the FieldList and of the physical row
+        # layout – it is merely not offered to consumers that display the
+        # visible fields. This is what lets a grain-key column filtered out
+        # by field_filter keep carrying fact identities downstream.
+        self.hidden = bool(hidden)
 
     def clone(self, **attributes):
         """Clone a field and set attributes"""
@@ -230,7 +237,8 @@ class Field(object):
                       self.label,
                       copy.deepcopy(self.info, memo),
                       self.origin,
-                      self.description)
+                      self.description,
+                      self.hidden)
         return field
 
     def __str__(self):
@@ -427,6 +435,20 @@ class FieldList(object):
                 raise NoSuchFieldError("Field list has no field with name "
                                         "'%s'" % (ref,) )
 
+    def hidden_fields(self):
+        """Returns a tuple of fields marked as hidden. Hidden fields remain
+        part of the field list (and therefore of the row layout), they are
+        merely excluded from :meth:`visible_fields`."""
+        return tuple(f for f in self._fields if f.hidden)
+
+    def visible_fields(self):
+        """Returns a tuple of fields that are not hidden."""
+        return tuple(f for f in self._fields if not f.hidden)
+
+    def visible_names(self):
+        """Returns names of the visible fields, in field-list order."""
+        return [f.name for f in self._fields if not f.hidden]
+
     def __len__(self):
         return len(self._fields)
 
@@ -502,11 +524,19 @@ class FieldList(object):
 class FieldFilter(object):
     """Filters fields in a stream"""
     # TODO: preserve order of "keep"
-    def __init__(self, keep=None, drop=None, rename=None):
+    def __init__(self, keep=None, drop=None, rename=None, grain_fields=None):
         """Creates a field map. `rename` is a dictionary where keys are input
         field names and values are output field names. `drop` is list of
         field names that will be dropped from the stream. If `keep` is used,
-        then all fields are dropped except those specified in `keep` list."""
+        then all fields are dropped except those specified in `keep` list.
+
+        `grain_fields` is an optional list of field names that carry fact
+        grain identities. A grain field that the keep/drop selection would
+        remove is not removed after all: it stays in the resulting field
+        list and in the physical row layout, but its field is marked as
+        hidden. This preserves the identity needed by grain-aware
+        aggregation while the visible schema remains identical to what the
+        caller asked for. Explicitly kept grain fields stay visible."""
         if drop and keep:
             raise MetadataError("You can nott specify both 'keep' and 'drop' "
                                 "options in FieldFilter.")
@@ -525,9 +555,27 @@ class FieldFilter(object):
         else:
             self.keep = []
 
+        if grain_fields:
+            self.grain_fields = [str(f) for f in grain_fields]
+        else:
+            self.grain_fields = []
+
+    def is_selected(self, field_name):
+        """Returns ``True`` when the field passes the keep/drop selection
+        (ignoring grain protection)."""
+        if self.drop:
+            return field_name not in self.drop
+        if self.keep:
+            return field_name in self.keep
+        return True
+
     def filter(self, fields):
         """Map `fields` according to the FieldFilter: rename or drop fields as
         specified. Returns a new FieldList object.
+
+        Grain-key fields that the selection would drop are retained and
+        flagged hidden instead of being removed, so the row layout keeps
+        carrying their identities.
 
         .. note::
 
@@ -550,6 +598,10 @@ class FieldFilter(object):
             if field not in names:
                 raise NoSuchFieldError(field)
 
+        for field in self.grain_fields:
+            if field not in names:
+                raise NoSuchFieldError(field)
+
         for field in fields:
             if field.name in self.rename:
                 # Create a copy and rename field if it is mapped
@@ -558,10 +610,18 @@ class FieldFilter(object):
             else:
                 new_field = field
 
-            if (self.drop and field.name not in self.drop) or \
-                (self.keep and field.name in self.keep) or \
-                not (self.keep or self.drop):
+            if self.is_selected(field.name):
+                # Explicitly selected columns are visible; a rename-only
+                # filter preserves whatever hidden flag the field had.
+                new_field = copy.copy(new_field)
+                if self.keep or self.drop:
+                    new_field.hidden = False
                 output_fields.append(new_field)
+            elif field.name in self.grain_fields:
+                # Protected identity column: keep the data but hide it.
+                hidden_field = copy.copy(new_field)
+                hidden_field.hidden = True
+                output_fields.append(hidden_field)
 
         return output_fields
 
@@ -574,17 +634,16 @@ class FieldFilter(object):
 
     def field_mask(self, fields):
         """Returns a list where ``True`` value is set for field that is selected
-        and ``False`` for field that has to be ignored. Selectors of fields can
-        be used by `itertools.compress()`. This is the preferred way of field
-        filtering.
+        (or a protected grain field) and ``False`` for field that has to be
+        ignored. Selectors of fields can be used by `itertools.compress()`.
+        This is the preferred way of field filtering.
         """
 
         selectors = []
 
         for field in fields:
-            flag = (self.drop and field.name not in self.drop) \
-                    or (self.keep and field.name in self.keep) \
-                    or not (self.keep or self.drop)
+            flag = self.is_selected(field.name) \
+                    or field.name in self.grain_fields
             selectors.append(flag)
 
         return selectors

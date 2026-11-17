@@ -92,7 +92,7 @@ def sort(ctx, obj, orderby):
 
 @operation
 def aggregate(ctx, obj, key, measures=None, include_count=True,
-      count_field="record_count"):
+      count_field="record_count", measure_grains=None, grain_counts=None):
     raise NotImplementedError
 
 

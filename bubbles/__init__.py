@@ -1,5 +1,6 @@
 from .metadata import *
 from .errors import *
+from .grains import *
 from .objects import *
 from .operation import *
 from .common import *

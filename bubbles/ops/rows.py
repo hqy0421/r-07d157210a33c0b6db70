@@ -8,6 +8,9 @@ from collections import OrderedDict, namedtuple
 from ..metadata import *
 from ..common import get_logger
 from ..errors import *
+from ..grains import (MeasureGrains, GrainAccumulator,
+                      prepare_measure_grains, get_measure_grains,
+                      merge_measure_grains)
 from ..operation import operation
 from ..objects import *
 from ..dev import experimental
@@ -30,7 +33,10 @@ def unary_iterator(func):
     @functools.wraps(func)
     def decorator(ctx, obj, *args, **kwargs):
         result = func(ctx, obj, *args, **kwargs)
-        return IterableDataSource(result, obj.fields.clone())
+        wrapped = IterableDataSource(result, obj.fields.clone())
+        # Row-preserving operations keep the fact-grain declarations valid.
+        wrapped.measure_grains = get_measure_grains(obj)
+        return wrapped
 
     return decorator
 
@@ -81,7 +87,13 @@ def _(ctx, obj, typemap):
 def _(ctx, iterator, keep=None, drop=None, rename=None, filter=None):
     """Filters fields in `iterator` according to the `field_filter`.
     `iterator` should be a rows iterator and `fields` is list of iterator's
-    fields."""
+    fields.
+
+    Fields that carry declared grain identities are protected: instead of
+    being physically removed they stay in the rows as hidden fields, so
+    downstream grain-aware aggregation still sees the identities. The
+    visible field names and their order are exactly what the filter asked
+    for."""
     if filter:
         if keep or drop or rename:
             raise OperationError("Either filter or keep, drop, rename should "
@@ -89,14 +101,29 @@ def _(ctx, iterator, keep=None, drop=None, rename=None, filter=None):
         else:
             field_filter = filter
     else:
-        field_filter = FieldFilter(keep=keep, drop=drop, rename=rename)
+        grain_fields = _grain_field_names(iterator)
+        field_filter = FieldFilter(keep=keep, drop=drop, rename=rename,
+                                   grain_fields=grain_fields)
 
     row_filter = field_filter.row_filter(iterator.fields)
 
     new_iterator = map(row_filter, iterator)
     new_fields = field_filter.filter(iterator.fields)
 
-    return IterableDataSource(new_iterator, new_fields)
+    result = IterableDataSource(new_iterator, new_fields)
+    result.measure_grains = get_measure_grains(iterator).renamed(
+        field_filter.rename)
+    return result
+
+
+def _grain_field_names(obj):
+    """Collects every field name used as a grain key on `obj`."""
+    names = []
+    for declaration in get_measure_grains(obj).declarations():
+        for name in declaration.grain:
+            if name not in names:
+                names.append(name)
+    return names
 
 
 #############################################################################
@@ -210,7 +237,9 @@ def _(ctx, obj, predicate, fields, discard=False,
     key = prepare_key(fields)
     indexes = obj.fields.indexes(key)
 
-    return iterator(indexes)
+    result = IterableDataSource(iterator(indexes), obj.fields.clone())
+    result.measure_grains = get_measure_grains(obj)
+    return result
 
 
 @filter_by_predicate.register("records")
@@ -221,11 +250,16 @@ def _(ctx, iterator, predicate, fields, discard=False,
     to be passed to the function (in that order). `kwargs` are additional key
     arguments to the predicate function."""
 
-    for record in iterator:
-        args = [record[str(f)] for f in fields]
-        flag = predicate(*args, **kwargs)
-        if (flag and not discard) or (not flag and discard):
-            yield record
+    def record_iterator():
+        for record in iterator:
+            args = [record[str(f)] for f in fields]
+            flag = predicate(*args, **kwargs)
+            if (flag and not discard) or (not flag and discard):
+                yield record
+
+    result = IterableRecordsDataSource(record_iterator(), iterator.fields)
+    result.measure_grains = get_measure_grains(iterator)
+    return result
 
 
 @distinct.register("rows")
@@ -265,7 +299,11 @@ def _(ctx, obj, key=None, is_sorted=False):
     # Retain original order of fields
     fields = FieldList(*row_filter(obj.fields))
 
-    return IterableDataSource(iterator(row_filter), fields)
+    result = IterableDataSource(iterator(row_filter), fields)
+    # The output only carries the distinct key columns; the measures (and
+    # therefore their grain declarations) no longer exist here.
+    result.measure_grains = MeasureGrains()
+    return result
 
 
 @distinct_rows.register("rows")
@@ -410,7 +448,7 @@ aggregation_functions = {
 
 @aggregate.register("rows")
 def _(ctx, obj, key, measures=None, include_count=True,
-      count_field="record_count"):
+      count_field="record_count", measure_grains=None, grain_counts=None):
     """Aggregates measure fields in `iterator` by `keys`. `fields` is a field
     list of the iterator, `keys` is a list of fields that will be used as
     keys. `aggregations` is a list of measures to be aggregated.
@@ -420,8 +458,30 @@ def _(ctx, obj, key, measures=None, include_count=True,
     of measures into this form.
 
     Output of this iterator is an iterator that yields rows with fields that
-    contain: key fields, measures (as specified in the measures list) and
-    optional record count if `include_count` is ``True`` (default).
+    contain: key fields, measures (as specified in the measures list),
+    optional grain counts and an optional record count if `include_count` is
+    ``True`` (default).
+
+    Fact-grain aware aggregation:
+
+    * `measure_grains` declares, per measure, a non-NULL grain key. It may be
+      a mapping ``{measure: grain_field}``, a list of
+      ``(measure, grain_field)`` tuples or a :class:`MeasureGrains` object.
+      When omitted, the declarations attached to `obj` (for example by a
+      preceding join) are used. A measure with a declared grain contributes
+      once per distinct surviving grain identity in each group – order-level
+      measures are therefore not multiplied by the joined detail rows, while
+      detail-level measures follow their own detail key. Two rows with the
+      same identity but different non-NULL values raise
+      :class:`GrainConflictError`. Sum ignores NULL and an all-NULL grain
+      yields NULL; amounts are never used to deduplicate or merge facts.
+    * `grain_counts` is an optional list of grain-key field names (or
+      ``(output_name, grain_field)`` tuples). Every listed grain gets one
+      integer output field counting distinct grain identities in the group,
+      independently of any measure value.
+
+    When neither `measure_grains` nor object-level declarations exist, the
+    legacy row-wise semantics are preserved exactly.
 
     Result is not ordered even the input was ordered.
 
@@ -431,6 +491,87 @@ def _(ctx, obj, key, measures=None, include_count=True,
         fit your expectations in regards of speed and memory consumption for
         large datasets.
     """
+
+    # TODO: create sorted version
+    # TODO: include SQL style COUNT(field) to count non-NULL values
+
+    # Coalesce to a list if just one is specified. A None/empty key means
+    # whole-stream aggregation into one group.
+    keys = prepare_key(key) if key else ()
+    measures = prepare_aggregation_list(measures)
+
+    effective_grains = prepare_measure_grains(
+        measure_grains if measure_grains is not None
+        else get_measure_grains(obj))
+    if effective_grains:
+        effective_grains.validate(obj.fields)
+
+    grain_counts = _prepare_grain_counts(grain_counts, obj.fields)
+
+    if not effective_grains and not grain_counts:
+        return _aggregate_rows_legacy(obj, keys, measures, include_count,
+                                      count_field)
+    return _aggregate_rows_grain_aware(obj, keys, measures, include_count,
+                                       count_field, effective_grains,
+                                       grain_counts)
+
+
+def _prepare_grain_counts(grain_counts, fields):
+    """Normalizes the `grain_counts` argument into a list of
+    `(output_name, grain_key_tuple)` tuples and validates the fields."""
+
+    if not grain_counts:
+        return []
+
+    result = []
+    for item in grain_counts:
+        if isinstance(item, (list, tuple)):
+            output_name, grain = item
+        else:
+            grain = item
+            output_name = "%s_count" % str(grain)
+        grain_key = prepare_key(grain)
+        for name in grain_key:
+            if name not in fields.names():
+                raise NoSuchFieldError(
+                    "Grain count field '%s' is not a field of the object"
+                    % name)
+        result.append((output_name, grain_key))
+    return result
+
+
+def _aggregate_output_fields(obj, keys, measures, include_count, count_field,
+                             grain_counts):
+    """Builds the output FieldList shared by both aggregation paths."""
+
+    out_fields = FieldList()
+    if keys:
+        out_fields += obj.fields.fields(keys)
+
+    for measure in measures:
+        name = measure[0]
+        aggregate = measure[1]
+        field = obj.fields.field(name)
+        field = field.clone(name="%s_%s" % (name, aggregate),
+                            analytical_type="measure")
+        out_fields.append(field)
+
+    for output_name, grain_key in grain_counts:
+        out_fields.append(Field(output_name,
+                                storage_type="integer",
+                                analytical_type="measure"))
+
+    if include_count:
+        out_fields.append(Field(count_field,
+                            storage_type="integer",
+                            analytical_type="measure"))
+
+    return out_fields
+
+
+def _aggregate_rows_legacy(obj, keys, measures, include_count, count_field):
+    """The original row-wise aggregation. Kept byte-for-byte in behaviour so
+    objects without grain declarations aggregate exactly as before."""
 
     def aggregation_result(keys, aggregates, measure_aggregates):
         # Pass results to output
@@ -451,17 +592,9 @@ def _(ctx, obj, key, measures=None, include_count=True,
 
             yield row
 
-    # TODO: create sorted version
-    # TODO: include SQL style COUNT(field) to count non-NULL values
-
-    # Coalesce to a list if just one is specified
-    keys = prepare_key(key)
-
-    measures = prepare_aggregation_list(measures)
-
     # Prepare output fields
-    out_fields = FieldList()
-    out_fields += obj.fields.fields(keys)
+    out_fields = _aggregate_output_fields(obj, keys, measures, include_count,
+                                          count_field, [])
 
     measure_fields = set()
     measure_aggregates = []
@@ -472,16 +605,6 @@ def _(ctx, obj, key, measures=None, include_count=True,
 
         measure_aggregates.append( (name, index, aggregate) )
         measure_fields.add(name)
-
-        field = obj.fields.field(name)
-        field = field.clone(name="%s_%s" % (name, aggregate),
-                            analytical_type="measure")
-        out_fields.append(field)
-
-    if include_count:
-        out_fields.append(Field(count_field,
-                            storage_type="integer",
-                            analytical_type="measure"))
 
     if keys:
         key_selectors = obj.fields.indexes(keys)
@@ -524,6 +647,72 @@ def _(ctx, obj, key, measures=None, include_count=True,
     return IterableDataSource(iterator, out_fields)
 
 
+def _aggregate_rows_grain_aware(obj, keys, measures, include_count,
+                                count_field, measure_grains, grain_counts):
+    """Grain-aware aggregation path. Measures with a declared grain are
+    accumulated once per surviving grain identity per group; measures
+    without one keep row-wise accumulation but gain NULL-aware
+    summation."""
+
+    out_fields = _aggregate_output_fields(obj, keys, measures, include_count,
+                                          count_field, grain_counts)
+
+    if keys:
+        key_selectors = obj.fields.indexes(keys)
+    else:
+        key_selectors = []
+
+    row_measures = []
+    grain_measures = []
+    for name, aggregate in measures:
+        index = obj.fields.index(name)
+        grain = measure_grains.grain_for(name)
+        if grain is None:
+            row_measures.append((name, index, aggregate))
+        else:
+            if aggregate not in ("sum", "min", "max", "average", "count"):
+                raise ArgumentError(
+                    "Grain-aware aggregation '%s' is not supported for "
+                    "measure '%s'" % (aggregate, name))
+            grain_indexes = tuple(obj.fields.index(g) for g in grain)
+            grain_measures.append((name, index, grain_indexes, aggregate))
+
+    count_indexes = []
+    for output_name, grain_key in grain_counts:
+        count_indexes.append(
+            (output_name, tuple(obj.fields.index(g) for g in grain_key)))
+
+    groups = {}
+    group_order = []
+
+    for row in obj.rows():
+        group_key = tuple(row[s] for s in key_selectors)
+        try:
+            accumulator = groups[group_key]
+        except KeyError:
+            accumulator = GrainAccumulator(row_measures, grain_measures,
+                                           count_indexes)
+            groups[group_key] = accumulator
+            group_order.append(group_key)
+        accumulator.add_row(row)
+
+    def iterator():
+        for group_key in group_order:
+            accumulator = groups[group_key]
+            row_results, grain_results, count_results, record_count = \
+                accumulator.results()
+
+            out_row = list(group_key)
+            out_row.extend(row_results)
+            out_row.extend(grain_results)
+            out_row.extend(count_results)
+            if include_count:
+                out_row.append(record_count)
+            yield out_row
+
+    return IterableDataSource(iterator(), out_fields)
+
+
 #############################################################################
 # Transpose
 
@@ -552,7 +741,11 @@ def _(ctx, obj, key, column_field, value_field):
     transpose_filter = FieldFilter(drop=key).row_filter(obj.fields)
     transpose_names = transpose_filter(obj.fields.names())
 
-    return IterableDataSource(iterator(), out_fields)
+    result = IterableDataSource(iterator(), out_fields)
+    # Measures are reshaped into generic name/value pairs, so their original
+    # grain declarations have no meaning on the transposed object.
+    result.measure_grains = MeasureGrains()
+    return result
 
 #############################################################################
 # Field Operations
@@ -752,7 +945,14 @@ def _(ctx, objects):
     iterators = [iter(obj) for obj in objects]
     iterator = itertools.chain(*iterators)
 
-    return IterableDataSource(iterator, objects[0].fields)
+    result = IterableDataSource(iterator, objects[0].fields)
+    # All appended objects describe the same facts in the same layout; their
+    # grain declarations therefore have to agree.
+    grains = get_measure_grains(objects[0])
+    for obj in objects[1:]:
+        grains = merge_measure_grains(grains, obj)
+    result.measure_grains = grains
+    return result
 
 
 
@@ -804,7 +1004,32 @@ def _(self, master, detail, master_key, detail_key):
         if str(field) not in detail_key:
             out_fields.append(field)
 
-    return IterableDataSource(result, out_fields)
+    result_object = IterableDataSource(result, out_fields)
+
+    # The join preserves every row of both sides (with fan-out), so the
+    # fact-grain declarations of both operands remain valid. Merging also
+    # catches contradictory declarations of the same measure.
+    result_object.measure_grains = merge_measure_grains(master, detail)
+    _validate_grain_fields(result_object)
+
+    return result_object
+
+
+def _validate_grain_fields(obj):
+    """Ensures every field referenced by the object's grain declarations
+    survived into the object's field list."""
+    fields = obj.fields
+    names = set(fields.names())
+    for declaration in get_measure_grains(obj).declarations():
+        if declaration.measure not in names:
+            raise NoSuchFieldError(
+                "Grain measure '%s' was lost during the operation"
+                % declaration.measure)
+        for name in declaration.grain:
+            if name not in names:
+                raise NoSuchFieldError(
+                    "Grain key field '%s' of measure '%s' was lost during "
+                    "the operation" % (name, declaration.measure))
 
 
 #############################################################################

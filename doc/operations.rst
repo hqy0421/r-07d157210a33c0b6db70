@@ -167,7 +167,7 @@ Ordering
 Aggregation
 ===========
 
-.. function:: aggregate(object, key[, measures])
+.. function:: aggregate(object, key[, measures][, measure_grains][, grain_counts])
 
     Returns an aggregated representation of `object` by `key`. All fields of
     analytical type `measure` are aggregated if no `measures` is specified.
@@ -176,6 +176,41 @@ Aggregation
     ``min``, ``max``
 
     Signatures: ``rows``, ``sql``
+
+    Fact-grain aware aggregation
+    ----------------------------
+
+    Joining a master (fact) table with a detail table fans every master row
+    out to its matching detail rows, so a plain row-wise sum of a
+    master-level measure counts it multiple times. Pass ``measure_grains`` to
+    declare, per measure, the non-NULL grain key that identifies one fact at
+    the measure's grain. It accepts a mapping ``{measure: grain_field}``, a
+    list of ``(measure, grain_field)`` tuples or a
+    :class:`bubbles.MeasureGrains` object. A grain key may be a single field
+    or a list of fields.
+
+    With the declaration in place an order-level measure (grain
+    ``order_id``) contributes once per surviving order identity in every
+    group, while a detail-level measure (grain ``line_id``) follows its own
+    detail key. Facts are merged by identity, never by amount, so two orders
+    with the same amount remain two facts. If the same identity carries two
+    different non-NULL values, :class:`bubbles.GrainConflictError` is raised.
+    ``sum`` ignores NULL and an all-NULL grain yields NULL. Grain
+    declarations attached to the source object survive native joins, row
+    filters and ``field_filter`` column filtering/renaming; a grain column
+    hidden through ``field_filter`` stays in the row layout as a hidden
+    field instead of being dropped.
+
+    ``grain_counts`` is an optional list of grain-key fields (or
+    ``(output_name, grain_field)`` tuples). Each produces an integer column
+    counting the distinct grain identities in a group, regardless of the
+    measure values.
+
+    When no grain is declared the aggregation keeps its original row-wise
+    semantics. On the SQL backend the grain-aware path is expressed with
+    window functions and the grouped result is materialized; if the database
+    cannot execute it, the operation retries through the pure-Python
+    implementation and still returns a natively consumable rows object.
 
 Field Operations
 ================

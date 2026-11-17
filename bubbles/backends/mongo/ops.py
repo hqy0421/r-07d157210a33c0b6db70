@@ -5,6 +5,7 @@ from ...metadata import *
 from ...errors import *
 from ...prototypes import *
 from ...objects import *
+from ...grains import get_measure_grains
 
 def prepare_mongo_key(key):
     key = prepare_key(key)
@@ -28,13 +29,21 @@ def _(ctx, obj, keep=None, drop=None, rename=None, filter=None):
         else:
             field_filter = filter
     else:
-        field_filter = FieldFilter(keep=keep, drop=drop, rename=rename)
+        grain_fields = []
+        for declaration in get_measure_grains(obj).declarations():
+            for name in declaration.grain:
+                if name not in grain_fields:
+                    grain_fields.append(name)
+        field_filter = FieldFilter(keep=keep, drop=drop, rename=rename,
+                                   grain_fields=grain_fields)
 
     new_fields = field_filter.filter(obj.fields)
 
     # No need to actually do anything just pretend that we have new fields.
 
-    return obj.clone(fields=new_fields)
+    result = obj.clone(fields=new_fields)
+    result.measure_grains = get_measure_grains(obj)
+    return result
 
 #############################################################################
 # Row Operations
